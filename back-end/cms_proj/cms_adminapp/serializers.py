@@ -1,6 +1,7 @@
 """Serializers for the administrator API."""
 
 from decimal import Decimal
+import math
 import re
 
 from django.contrib.auth import get_user_model
@@ -11,6 +12,7 @@ from rest_framework import serializers
 
 from cms_backendapp.models import AuditLog, Department, LabTestCatalog, Role, Setting, Staff, User
 from cms_doctorapp.models import Doctor
+from cms_labapp.models import LabTestResult
 from cms_pharmapp.models import Supplier
 
 
@@ -472,12 +474,15 @@ class AdminDepartmentSerializer(serializers.ModelSerializer):
 
 class AdminLabCatalogSerializer(serializers.ModelSerializer):
     id = serializers.CharField(source="test_catalog_id", read_only=True)
-    name = serializers.CharField(source="test_name")
+    name = serializers.CharField(source="test_name", min_length=2, max_length=100)
     testName = serializers.CharField(source="test_name", read_only=True)
-    sampleType = serializers.CharField(source="sample_type", required=False, allow_null=True, allow_blank=True)
-    turnaroundHrs = serializers.IntegerField(source="turnaround_hrs", required=False)
+    sampleType = serializers.CharField(source="sample_type", required=False, allow_null=True, allow_blank=True, max_length=50)
+    turnaroundHrs = serializers.IntegerField(source="turnaround_hrs", required=True, min_value=1, max_value=720)
     price = PaiseField(required=False)
-    code = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    code = serializers.CharField(required=True, allow_blank=False, max_length=20)
+    category = serializers.CharField(required=False, allow_null=True, allow_blank=True, max_length=50)
+    description = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    parameters = serializers.JSONField(required=True)
     isActive = serializers.BooleanField(source="is_active", required=False)
     departmentId = serializers.PrimaryKeyRelatedField(source="department", queryset=Department.objects.all(), required=False, allow_null=True)
 
@@ -490,8 +495,8 @@ class AdminLabCatalogSerializer(serializers.ModelSerializer):
 
     def validate_name(self, value):
         value = value.strip()
-        if not value:
-            raise serializers.ValidationError("Test name is required.")
+        if len(value) < 2:
+            raise serializers.ValidationError("Test name must be at least 2 characters.")
         duplicate = LabTestCatalog.objects.filter(test_name__iexact=value)
         if self.instance:
             duplicate = duplicate.exclude(pk=self.instance.pk)
@@ -500,24 +505,119 @@ class AdminLabCatalogSerializer(serializers.ModelSerializer):
         return value
 
     def validate_code(self, value):
-        value = value.strip() or None if value else None
-        if value:
-            duplicate = LabTestCatalog.objects.filter(code__iexact=value)
-            if self.instance:
-                duplicate = duplicate.exclude(pk=self.instance.pk)
-            if duplicate.exists():
-                raise serializers.ValidationError("A lab test with this code already exists.")
+        value = value.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9_-]+", value):
+            raise serializers.ValidationError("Use uppercase letters, numbers, hyphens, or underscores with no spaces.")
+        duplicate = LabTestCatalog.objects.filter(code__iexact=value)
+        if self.instance:
+            duplicate = duplicate.exclude(pk=self.instance.pk)
+        if duplicate.exists():
+            raise serializers.ValidationError("Test code already exists.")
         return value
 
+    def validate_category(self, value):
+        return value.strip() if isinstance(value, str) else value
+
+    def validate_sampleType(self, value):
+        return value.strip() if isinstance(value, str) else value
+
     def validate_turnaroundHrs(self, value):
-        if value < 1:
-            raise serializers.ValidationError("Turnaround time must be at least one hour.")
+        if value > 720:
+            raise serializers.ValidationError("Turnaround time cannot exceed 720 hours.")
         return value
+
+    def validate(self, attrs):
+        name = attrs.get("test_name", getattr(self.instance, "test_name", ""))
+        category = attrs.get("category", getattr(self.instance, "category", ""))
+        duplicates = LabTestCatalog.objects.filter(test_name__iexact=name)
+        if category:
+            duplicates = duplicates.filter(category__iexact=category)
+        if self.instance:
+            duplicates = duplicates.exclude(pk=self.instance.pk)
+        if duplicates.exists():
+            raise serializers.ValidationError({"name": "A test with this name already exists in this category."})
+        return attrs
 
     def validate_parameters(self, value):
         if not isinstance(value, list):
             raise serializers.ValidationError("Parameters must be a JSON array.")
-        return value
+        if self.instance is None and not value:
+            raise serializers.ValidationError("At least one test parameter is required.")
+        names = set()
+        indexed_errors = [{} for _ in value]
+        normalized = []
+        for index, parameter in enumerate(value):
+            if not isinstance(parameter, dict) or not isinstance(parameter.get("name"), str) or not parameter["name"].strip():
+                indexed_errors[index]["name"] = "Parameter name is required."
+                normalized.append(parameter)
+                continue
+            name = parameter["name"].strip()
+            parameter = {**parameter, "name": name}
+            unit = parameter.get("unit")
+            if unit is not None and not isinstance(unit, str):
+                indexed_errors[index]["unit"] = "Unit must be text."
+            elif isinstance(unit, str):
+                parameter["unit"] = unit.strip()
+                if len(unit.strip()) > 30:
+                    indexed_errors[index]["unit"] = "Unit cannot exceed 30 characters."
+            if name.casefold() in names:
+                indexed_errors[index]["name"] = "Parameter names must be unique within this test."
+            names.add(name.casefold())
+            parsed_bounds = {}
+            for key in ("refMin", "refMax", "criticalMin", "criticalMax"):
+                bound = parameter.get(key)
+                if bound is None:
+                    parsed_bounds[key] = None
+                    continue
+                if isinstance(bound, bool):
+                    indexed_errors[index][key] = "Enter a valid non-negative number."
+                    parsed_bounds[key] = None
+                    continue
+                try:
+                    numeric_bound = float(bound)
+                    if not math.isfinite(numeric_bound) or numeric_bound < 0:
+                        raise ValueError
+                except (TypeError, ValueError) as exc:
+                    indexed_errors[index][key] = "Enter a valid non-negative number."
+                    parsed_bounds[key] = None
+                    continue
+                parsed_bounds[key] = numeric_bound
+                parameter[key] = numeric_bound
+            ref_min = parsed_bounds.get("refMin")
+            ref_max = parsed_bounds.get("refMax")
+            critical_min = parsed_bounds.get("criticalMin")
+            critical_max = parsed_bounds.get("criticalMax")
+            if ref_min is not None and ref_max is not None and ref_min >= ref_max:
+                indexed_errors[index]["refMax"] = "Reference maximum must be greater than the minimum."
+            if critical_min is not None and (ref_min is None or critical_min > ref_min):
+                indexed_errors[index]["criticalMin"] = "Critical low must be less than or equal to the reference minimum."
+            if critical_max is not None and (ref_max is None or critical_max < ref_max):
+                indexed_errors[index]["criticalMax"] = "Critical high must be greater than or equal to the reference maximum."
+            normalized.append(parameter)
+
+        if any(indexed_errors):
+            raise serializers.ValidationError(indexed_errors)
+
+        if self.instance:
+            saved_names = {}
+            for results in LabTestResult.objects.filter(
+                test__test_catalog_id=self.instance.pk
+            ).values_list("results", flat=True):
+                if isinstance(results, list):
+                    for row in results:
+                        if isinstance(row, dict) and row.get("parameter"):
+                            saved_name = str(row["parameter"])
+                            saved_names[saved_name.casefold()] = saved_name
+                elif isinstance(results, dict):
+                    saved_names.update({str(name).casefold(): str(name) for name in results})
+            next_names = {item["name"].casefold() for item in normalized if isinstance(item, dict)}
+            removed = set(saved_names) - next_names
+            if removed:
+                removed_name = saved_names[sorted(removed)[0]]
+                raise serializers.ValidationError({
+                    "parameters": f"Cannot remove or rename '{removed_name}' because saved lab results use it."
+                })
+        return normalized
 
 
 class AdminSupplierSerializer(serializers.ModelSerializer):

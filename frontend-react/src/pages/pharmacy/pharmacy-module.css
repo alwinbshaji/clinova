@@ -831,8 +831,13 @@
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 8px;
   white-space: nowrap;
+}
+
+.pharmacy-inventory-actions .pharmacy-row-menu {
+  display: none;
 }
 
 .pharmacy-inventory-actions .btn {
@@ -854,6 +859,12 @@
   color: var(--danger, #b91c1c);
   font-size: 0.75rem;
   line-height: 1.4;
+}
+
+.app.role-pharmacist .form-input[aria-invalid="true"],
+.app.role-pharmacist .form-control[aria-invalid="true"] {
+  border-color: var(--danger, #b91c1c);
+  box-shadow: 0 0 0 1px var(--danger, #b91c1c);
 }
 
 .app.role-pharmacist .pharmacy-stock-summary {

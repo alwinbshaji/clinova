@@ -7,6 +7,7 @@ import { normalizeError } from '../../api/errors';
 import { adminApi } from '../../api/admin';
 import { purchaseOrdersApi } from '../../api/resources';
 import { formatDate, formatDateTime, formatPaise } from '../../utils/format';
+import LabTestCreateForm from '../shared/LabTestCreateForm';
 
 const PAGE_SIZE = 200;
 
@@ -56,6 +57,31 @@ function FilterBar({ children }) {
 
 function errorMessage(error) {
   return normalizeError(error).message || 'The request failed. Please try again.';
+}
+
+function labCatalogErrors(error) {
+  const responseErrors = error?.response?.data || {};
+  const fields = {};
+  let form = '';
+  const messageText = (value) => Array.isArray(value) ? value.join(' ') : typeof value === 'string' ? value : '';
+  for (const key of ['name', 'code', 'category', 'sampleType', 'turnaroundHrs', 'price', 'description']) {
+    if (responseErrors[key]) fields[key] = messageText(responseErrors[key]);
+  }
+  if (Array.isArray(responseErrors.parameters)) {
+    responseErrors.parameters.forEach((parameterErrors, index) => {
+      if (!parameterErrors || typeof parameterErrors !== 'object' || Array.isArray(parameterErrors)) {
+        form ||= messageText(parameterErrors);
+        return;
+      }
+      for (const [key, value] of Object.entries(parameterErrors)) {
+        if (value) fields[`parameters.${index}.${key}`] = messageText(value);
+      }
+    });
+  } else if (responseErrors.parameters) {
+    form = messageText(responseErrors.parameters);
+  }
+  form ||= messageText(responseErrors.detail) || errorMessage(error);
+  return { fields, form };
 }
 
 function roleLabel(role, roleRows = []) {
@@ -244,8 +270,6 @@ export function AdminDepartmentsPage() {
   );
 }
 
-const EMPTY_LAB_TEST = { name: '', code: '', category: '', sampleType: '', turnaroundHrs: '4', description: '', priceRupees: '', parameters: '[]', isActive: true };
-
 export function AdminLabCatalogPage() {
   const client = useQueryClient();
   const toast = useToast();
@@ -254,9 +278,10 @@ export function AdminLabCatalogPage() {
   const [statusFilter, setStatusFilter] = useState('');
   const [editing, setEditing] = useState(null);
   const [price, setPrice] = useState('');
-  const [formOpen, setFormOpen] = useState(false);
-  const [form, setForm] = useState(EMPTY_LAB_TEST);
   const [formError, setFormError] = useState('');
+  const [labTestForm, setLabTestForm] = useState(null);
+  const [labTestFormError, setLabTestFormError] = useState('');
+  const [labTestFieldErrors, setLabTestFieldErrors] = useState({});
   const catalogQuery = useQuery({ queryKey: ['adminLabCatalog'], queryFn: () => fetchAllPages(labCatalogApi.list) });
   const priceMutation = useMutation({
     mutationFn: ({ id, value }) => labCatalogApi.update(id, { price: value }),
@@ -265,8 +290,13 @@ export function AdminLabCatalogPage() {
   });
   const saveMutation = useMutation({
     mutationFn: ({ id, data }) => id ? labCatalogApi.update(id, data) : labCatalogApi.create(data),
-    onSuccess: async (_data, variables) => { toast.success(variables.id ? 'Lab test updated.' : 'Lab test added.'); setEditing(null); setFormOpen(false); await client.invalidateQueries({ queryKey: ['adminLabCatalog'] }); },
-    onError: (error) => setFormError(errorMessage(error)),
+    onSuccess: async (_data, variables) => { toast.success(variables.id ? 'Lab test updated.' : 'Lab test added.'); setLabTestForm(null); setLabTestFormError(''); setLabTestFieldErrors({}); await Promise.all([client.invalidateQueries({ queryKey: ['adminLabCatalog'] }), client.invalidateQueries({ queryKey: ['labCatalog'] }), client.invalidateQueries({ queryKey: ['doctorLabCatalog'] })]); },
+    onError: (error) => { const mapped = labCatalogErrors(error); setLabTestFormError(mapped.form); setLabTestFieldErrors(mapped.fields); toast.error(mapped.form); },
+  });
+  const labTestStatusMutation = useMutation({
+    mutationFn: ({ test }) => labCatalogApi.update(test.id, { isActive: !test.isActive }),
+    onSuccess: async (_data, { test }) => { toast.success(`Lab test ${test.isActive ? 'deactivated' : 'activated'}.`); await Promise.all([client.invalidateQueries({ queryKey: ['adminLabCatalog'] }), client.invalidateQueries({ queryKey: ['labCatalog'] }), client.invalidateQueries({ queryKey: ['doctorLabCatalog'] })]); },
+    onError: (error) => toast.error(errorMessage(error)),
   });
   const categories = useMemo(() => [...new Set((catalogQuery.data || []).map((row) => row.category).filter(Boolean))].sort(), [catalogQuery.data]);
   const rows = useMemo(() => (catalogQuery.data || []).filter((row) => {
@@ -284,21 +314,10 @@ export function AdminLabCatalogPage() {
     { key: 'parameters', label: 'Parameters', render: (row) => Array.isArray(row.parameters) ? row.parameters.map((parameter) => parameter.name).filter(Boolean).join(', ') || '—' : '—' },
     { key: 'price', label: 'Price', sortable: true, render: (row) => formatPaise(row.price) },
     { key: 'isActive', label: 'Status', render: (row) => <Badge status={row.isActive ? 'ACTIVE' : 'INACTIVE'}>{row.isActive ? 'Active' : 'Inactive'}</Badge> },
-    { key: 'actions', label: 'Actions', render: (row) => <button type="button" className="btn btn--secondary btn--sm" onClick={() => { setEditing(row); setPrice((Number(row.price || 0) / 100).toFixed(2)); setFormError(''); }}>Edit Price</button> },
-  ], []);
-  const openCreate = () => { setEditing(null); setForm({ ...EMPTY_LAB_TEST }); setFormError(''); setFormOpen(true); };
-  const submit = (event) => {
-    event.preventDefault();
-    const rupees = Number(form.priceRupees);
-    const turnaround = Number(form.turnaroundHrs);
-    let parameters;
-    try { parameters = JSON.parse(form.parameters); } catch { return setFormError('Parameters must be valid JSON.'); }
-    if (!form.name.trim()) return setFormError('Enter a test name.');
-    if (!Number.isInteger(turnaround) || turnaround < 1) return setFormError('Enter a turnaround time of at least one hour.');
-    if (!Number.isFinite(rupees) || rupees < 0) return setFormError('Enter a valid non-negative price.');
-    if (!Array.isArray(parameters)) return setFormError('Parameters must be a JSON array.');
-    saveMutation.mutate({ id: editing?.id || null, data: { name: form.name.trim(), code: form.code.trim() || null, category: form.category.trim(), sampleType: form.sampleType.trim(), turnaroundHrs: turnaround, description: form.description.trim(), price: Math.round(rupees * 100), parameters, isActive: form.isActive } });
-  };
+    { key: 'actions', label: 'Actions', render: (row) => <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}><button type="button" className="btn btn--secondary btn--sm" onClick={() => { setLabTestForm({ mode: 'edit', test: row }); setLabTestFormError(''); setLabTestFieldErrors({}); }}>Edit</button><button type="button" className="btn btn--secondary btn--sm" onClick={() => { setEditing(row); setPrice((Number(row.price || 0) / 100).toFixed(2)); setFormError(''); }}>Edit Price</button><button type="button" className="btn btn--secondary btn--sm" onClick={() => labTestStatusMutation.mutate({ test: row })} disabled={labTestStatusMutation.isPending}>{row.isActive ? 'Deactivate' : 'Activate'}</button></div> },
+  ], [labTestStatusMutation]);
+  const openCreate = () => { setLabTestForm({ mode: 'create', test: null }); setLabTestFormError(''); setLabTestFieldErrors({}); };
+  const submitLabTest = (data) => saveMutation.mutate({ id: labTestForm?.mode === 'edit' ? labTestForm.test.id : null, data });
   const submitPrice = (event) => {
     event.preventDefault();
     const rupees = Number(price);
@@ -324,21 +343,19 @@ export function AdminLabCatalogPage() {
         </form>
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '1rem' }}><button type="button" className="btn btn--secondary" onClick={() => setEditing(null)} disabled={priceMutation.isPending}>Cancel</button><button type="submit" form="catalog-price-form" className="btn btn--primary" disabled={priceMutation.isPending}>{priceMutation.isPending ? 'Saving…' : 'Save Price'}</button></div>
       </Modal>
-      <Modal isOpen={formOpen} onClose={() => !saveMutation.isPending && setFormOpen(false)} title="Add Lab Test" size="lg">
-        <form id="catalog-create-form" onSubmit={submit} noValidate>
-          {formError && <p role="alert" style={{ color: 'var(--danger)' }}>{formError}</p>}
-          <div className="form-grid">
-            <FormField label="Test name" htmlFor="catalog-name" required><input id="catalog-name" className="form-control" maxLength={100} value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></FormField>
-            <FormField label="Code" htmlFor="catalog-code" hint="Optional; must be unique."><input id="catalog-code" className="form-control" maxLength={20} value={form.code} onChange={(event) => setForm({ ...form, code: event.target.value })} /></FormField>
-            <FormField label="Category" htmlFor="catalog-category-input"><input id="catalog-category-input" className="form-control" maxLength={50} value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })} /></FormField>
-            <FormField label="Sample type" htmlFor="catalog-sample"><input id="catalog-sample" className="form-control" maxLength={50} value={form.sampleType} onChange={(event) => setForm({ ...form, sampleType: event.target.value })} /></FormField>
-            <FormField label="Turnaround (hours)" htmlFor="catalog-turnaround" required><input id="catalog-turnaround" type="number" min="1" step="1" className="form-control" value={form.turnaroundHrs} onChange={(event) => setForm({ ...form, turnaroundHrs: event.target.value })} required /></FormField>
-            <FormField label="Price (Rs)" htmlFor="catalog-create-price" required><input id="catalog-create-price" type="number" min="0" step="0.01" className="form-control" value={form.priceRupees} onChange={(event) => setForm({ ...form, priceRupees: event.target.value })} required /></FormField>
-            <FormField label="Description" htmlFor="catalog-description"><textarea id="catalog-description" className="form-control" value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} /></FormField>
-            <FormField label="Parameters (JSON array)" htmlFor="catalog-parameters" hint={'Example: [{"name":"Hemoglobin"}]'}><textarea id="catalog-parameters" className="form-control" rows="4" value={form.parameters} onChange={(event) => setForm({ ...form, parameters: event.target.value })} /></FormField>
-          </div>
-        </form>
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '1rem' }}><button type="button" className="btn btn--secondary" onClick={() => setFormOpen(false)} disabled={saveMutation.isPending}>Cancel</button><button type="submit" form="catalog-create-form" className="btn btn--primary" disabled={saveMutation.isPending}>{saveMutation.isPending ? 'Saving...' : 'Add Lab Test'}</button></div>
+      <Modal isOpen={Boolean(labTestForm)} onClose={() => !saveMutation.isPending && setLabTestForm(null)} title={labTestForm?.mode === 'edit' ? `Edit Lab Test: ${labTestForm.test.name}` : 'Add Lab Test'} size="lg">
+        <LabTestCreateForm
+          key={labTestForm?.test?.id || 'new-lab-test'}
+          initialValues={labTestForm?.test}
+          existingTests={catalogQuery.data || []}
+          mode={labTestForm?.mode}
+          onSubmit={submitLabTest}
+          onCancel={() => setLabTestForm(null)}
+          onClearServerErrors={() => { setLabTestFormError(''); setLabTestFieldErrors({}); }}
+          isPending={saveMutation.isPending}
+          error={labTestFormError}
+          fieldErrors={labTestFieldErrors}
+        />
       </Modal>
     </div>
   );
@@ -354,15 +371,19 @@ export function AdminSuppliersPage() {
   const [selectedOrder, setSelectedOrder] = useState(null);
   const [supplierFormOpen, setSupplierFormOpen] = useState(false);
   const [supplierFormError, setSupplierFormError] = useState('');
-  const [supplierForm, setSupplierForm] = useState({ name: '', contactPerson: '', phone: '', email: '', address: '', typicalMedicines: '', isActive: true });
+  const [supplierForm, setSupplierForm] = useState({ name: '', contactPerson: '', phone: '', email: '', address: '', isActive: true });
   const supplierQuery = useQuery({ queryKey: ['adminSuppliers'], queryFn: () => fetchAllPages(suppliersApi.list) });
   const createSupplierMutation = useMutation({
     mutationFn: (data) => suppliersApi.create(data),
-    onSuccess: async () => { toast.success('Supplier added.'); setSupplierFormOpen(false); setSupplierFormError(''); setSupplierForm({ name: '', contactPerson: '', phone: '', email: '', address: '', typicalMedicines: '', isActive: true }); await client.invalidateQueries({ queryKey: ['adminSuppliers'] }); },
+    onSuccess: async () => { toast.success('Supplier added.'); setSupplierFormOpen(false); setSupplierFormError(''); setSupplierForm({ name: '', contactPerson: '', phone: '', email: '', address: '', isActive: true }); await client.invalidateQueries({ queryKey: ['adminSuppliers'] }); },
     onError: (error) => setSupplierFormError(errorMessage(error)),
   });
+  const supplierStatusMutation = useMutation({
+    mutationFn: ({ supplier }) => suppliersApi.update(supplier.id, { isActive: !supplier.isActive }),
+    onSuccess: async (_data, { supplier }) => { toast.success(`Supplier ${supplier.isActive ? 'deactivated' : 'activated'}.`); await client.invalidateQueries({ queryKey: ['adminSuppliers'] }); },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
   const orderQuery = useQuery({ queryKey: ['adminPurchaseOrders', supplierFilter, statusFilter], queryFn: () => fetchAllPages(purchaseOrdersApi.list, { ...(supplierFilter ? { supplier: supplierFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}) }) });
-  const supplierRateQuery = useQuery({ queryKey: ['adminSupplierRates', selectedSupplier?.id], queryFn: () => suppliersApi.rates(selectedSupplier.id), enabled: Boolean(selectedSupplier) });
   const orderDetailQuery = useQuery({ queryKey: ['adminPurchaseOrder', selectedOrder?.id], queryFn: () => purchaseOrdersApi.get(selectedOrder.id), enabled: Boolean(selectedOrder) });
   const suppliers = supplierQuery.data || [];
   const visibleSuppliers = suppliers.filter((supplier) => !supplierSearch.trim() || supplier.name.toLowerCase().includes(supplierSearch.trim().toLowerCase()));
@@ -370,7 +391,7 @@ export function AdminSuppliersPage() {
   const submitSupplier = (event) => {
     event.preventDefault();
     if (!supplierForm.name.trim()) return setSupplierFormError('Enter a supplier name.');
-    createSupplierMutation.mutate({ name: supplierForm.name.trim(), contactPerson: supplierForm.contactPerson.trim(), phone: supplierForm.phone.trim(), email: supplierForm.email.trim(), address: supplierForm.address.trim(), typicalMedicines: supplierForm.typicalMedicines.split(',').map((item) => item.trim()).filter(Boolean), isActive: supplierForm.isActive });
+    createSupplierMutation.mutate({ name: supplierForm.name.trim(), contactPerson: supplierForm.contactPerson.trim(), phone: supplierForm.phone.trim(), email: supplierForm.email.trim(), address: supplierForm.address.trim(), isActive: supplierForm.isActive });
   };
   const orders = orderQuery.data || [];
   const statuses = [...new Set(orders.map((order) => order.status).filter(Boolean))].sort();
@@ -379,10 +400,9 @@ export function AdminSuppliersPage() {
     { key: 'contactPerson', label: 'Contact', sortable: true, render: (row) => row.contactPerson || '—' },
     { key: 'phone', label: 'Phone', render: (row) => row.phone || '—' },
     { key: 'email', label: 'Email', render: (row) => row.email || '—' },
-    { key: 'typicalMedicines', label: 'Medicine References', render: (row) => Array.isArray(row.typicalMedicines) ? row.typicalMedicines.length : 0 },
     { key: 'isActive', label: 'Status', render: (row) => <Badge status={row.isActive ? 'ACTIVE' : 'INACTIVE'}>{row.isActive ? 'Active' : 'Inactive'}</Badge> },
-    { key: 'actions', label: 'Details', render: (row) => <button type="button" className="btn btn--secondary btn--sm" onClick={() => setSelectedSupplier(row)}>View</button> },
-  ], []);
+    { key: 'actions', label: 'Actions', render: (row) => <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}><button type="button" className="btn btn--secondary btn--sm" onClick={() => setSelectedSupplier(row)}>Details</button><button type="button" className="btn btn--secondary btn--sm" onClick={() => supplierStatusMutation.mutate({ supplier: row })} disabled={supplierStatusMutation.isPending}>{row.isActive ? 'Deactivate' : 'Activate'}</button></div> },
+  ], [supplierStatusMutation]);
   const orderColumns = useMemo(() => [
     { key: 'id', label: 'PO #', sortable: true, render: (row) => <strong>{row.id}</strong> },
     { key: 'orderDate', label: 'Order Date', sortable: true, render: (row) => formatDate(row.orderDate || row.createdAt) },
@@ -419,14 +439,13 @@ export function AdminSuppliersPage() {
             <FormField label="Phone" htmlFor="supplier-phone"><input id="supplier-phone" className="form-control" maxLength={20} value={supplierForm.phone} onChange={(event) => setSupplierForm({ ...supplierForm, phone: event.target.value })} /></FormField>
             <FormField label="Email" htmlFor="supplier-email"><input id="supplier-email" type="email" className="form-control" maxLength={100} value={supplierForm.email} onChange={(event) => setSupplierForm({ ...supplierForm, email: event.target.value })} /></FormField>
             <FormField label="Address" htmlFor="supplier-address"><textarea id="supplier-address" className="form-control" value={supplierForm.address} onChange={(event) => setSupplierForm({ ...supplierForm, address: event.target.value })} /></FormField>
-            <FormField label="Medicine references" htmlFor="supplier-medicines" hint="Separate names with commas."><textarea id="supplier-medicines" className="form-control" value={supplierForm.typicalMedicines} onChange={(event) => setSupplierForm({ ...supplierForm, typicalMedicines: event.target.value })} /></FormField>
             <label className="form-check"><input type="checkbox" checked={supplierForm.isActive} onChange={(event) => setSupplierForm({ ...supplierForm, isActive: event.target.checked })} /> Active</label>
           </div>
         </form>
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '1rem' }}><button type="button" className="btn btn--secondary" onClick={() => setSupplierFormOpen(false)} disabled={createSupplierMutation.isPending}>Cancel</button><button type="submit" form="supplier-create-form" className="btn btn--primary" disabled={createSupplierMutation.isPending}>{createSupplierMutation.isPending ? 'Saving...' : 'Add Supplier'}</button></div>
       </Modal>
       <Modal isOpen={Boolean(selectedSupplier)} onClose={() => setSelectedSupplier(null)} title={selectedSupplier?.name || 'Supplier details'}>
-        {supplierRateQuery.isLoading ? <LoadingState message="Loading supplier details..." /> : supplierRateQuery.error ? <ErrorState title="Unable to load supplier details" error={supplierRateQuery.error} onRetry={supplierRateQuery.refetch} /> : <div className="form-grid"><div><strong>Contact</strong><div>{selectedSupplier?.contactPerson || '—'}</div></div><div><strong>Phone</strong><div>{selectedSupplier?.phone || '—'}</div></div><div><strong>Email</strong><div>{selectedSupplier?.email || '—'}</div></div><div><strong>Address</strong><div>{selectedSupplier?.address || '—'}</div></div><div style={{ gridColumn: '1 / -1' }}><strong>Typical medicine references</strong><div>{Array.isArray(supplierRateQuery.data?.typicalMedicines) && supplierRateQuery.data.typicalMedicines.length ? supplierRateQuery.data.typicalMedicines.join(', ') : 'None listed'}</div><p className="text-caption">The supplier rates endpoint returns medicine references only; it does not return unit-price rates.</p></div></div>}
+        <div className="form-grid"><div><strong>Contact</strong><div>{selectedSupplier?.contactPerson || '—'}</div></div><div><strong>Phone</strong><div>{selectedSupplier?.phone || '—'}</div></div><div><strong>Email</strong><div>{selectedSupplier?.email || '—'}</div></div><div><strong>Address</strong><div>{selectedSupplier?.address || '—'}</div></div><div><strong>Status</strong><div>{selectedSupplier?.isActive ? 'Active' : 'Inactive'}</div></div></div>
       </Modal>
       <Modal isOpen={Boolean(selectedOrder)} onClose={() => setSelectedOrder(null)} title={orderDetailQuery.data ? `Purchase Order ${orderDetailQuery.data.id}` : 'Purchase Order details'} size="lg">
         {orderDetailQuery.isLoading ? <LoadingState message="Loading purchase order..." /> : orderDetailQuery.error ? <ErrorState title="Unable to load purchase order" error={orderDetailQuery.error} onRetry={orderDetailQuery.refetch} /> : orderDetailQuery.data && <div>

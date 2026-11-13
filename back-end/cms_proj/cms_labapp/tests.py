@@ -113,9 +113,9 @@ class LabDomainTests(APITestCase):
         self.catalog.refresh_from_db()
         self.assertEqual(self.catalog.price, Decimal("400.00"))
 
-    def test_lab_tech_can_create_tests_and_update_only_ranges(self):
+    def test_only_admin_can_create_tests_and_lab_tech_can_update_only_ranges(self):
         headers_lab = self.auth_headers(self.user_lab)
-        created = self.client.post(
+        lab_create = self.client.post(
             "/api/lab-catalog/",
             {
                 "name": "Serum Calcium",
@@ -139,21 +139,42 @@ class LabDomainTests(APITestCase):
             format="json",
             **headers_lab,
         )
-        self.assertEqual(created.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(created.data["price"], 0)
-        test_id = created.data["id"]
-
-        price_on_create = self.client.post(
-            "/api/lab-catalog/",
-            {
-                "name": "Serum Magnesium",
-                "price": 50000,
-                "parameters": [{"name": "Magnesium", "refMin": 1.7, "refMax": 2.2}],
-            },
+        self.assertEqual(lab_create.status_code, status.HTTP_403_FORBIDDEN)
+        admin_api_lab_create = self.client.post(
+            "/api/admin/lab-catalog/",
+            {"name": "Serum Sodium", "parameters": [{"name": "Sodium"}]},
             format="json",
             **headers_lab,
         )
-        self.assertEqual(price_on_create.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(admin_api_lab_create.status_code, status.HTTP_403_FORBIDDEN)
+
+        created = self.client.post(
+            "/api/lab-catalog/",
+            {
+                "name": "Serum Calcium",
+                "code": "CA",
+                "category": "Biochemistry",
+                "sampleType": "Serum",
+                "turnaroundHrs": 3,
+                "parameters": [
+                    {
+                        "name": "Calcium",
+                        "unit": "mg/dL",
+                        "dataType": "number",
+                        "required": True,
+                        "refMin": 8.5,
+                        "refMax": 10.5,
+                        "criticalMin": 6.0,
+                        "criticalMax": 14.0,
+                    }
+                ],
+            },
+            format="json",
+            **self.auth_headers(self.user_admin),
+        )
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(created.data["price"], 0)
+        test_id = created.data["id"]
 
         updated = self.client.patch(
             f"/api/lab-catalog/{test_id}/",

@@ -25,6 +25,7 @@ export function PharmacyBasicQueuePage() {
   const toast = useToast();
   const [selectedPrescription, setSelectedPrescription] = useState(null);
   const [quantities, setQuantities] = useState({});
+  const [dispenseErrors, setDispenseErrors] = useState({});
   const prescriptionsQuery = useQuery({
     queryKey: ['pharmacyPrescriptions'],
     queryFn: () => prescriptionsApi.list({ status: 'PENDING,PARTIALLY_DISPENSED', page_size: 200 }),
@@ -54,6 +55,7 @@ export function PharmacyBasicQueuePage() {
   const openDispense = (prescription) => {
     setSelectedPrescription(prescription);
     setQuantities(Object.fromEntries((prescription.items || []).map((item) => [item.id, ''])));
+    setDispenseErrors({});
   };
   const availableFor = (item) => {
     const medicine = medicinesById.get(String(item.medicineId));
@@ -68,15 +70,17 @@ export function PharmacyBasicQueuePage() {
     event.preventDefault();
     if (!selectedPrescription?.items?.length) return;
     const items = selectedPrescription.items.map((item) => ({ itemId: item.id, quantity: Number(quantities[item.id]) }));
-    if (items.some(({ quantity }) => !Number.isInteger(quantity) || quantity < 1)) {
-      toast.error('Enter a whole number greater than zero for every medicine.');
+    const errors = Object.fromEntries(selectedPrescription.items.flatMap((item) => {
+      const quantity = Number(quantities[item.id]);
+      if (!Number.isInteger(quantity) || quantity < 1) return [[item.id, 'Enter a whole number greater than zero.']];
+      if (quantity > availableFor(item)) return [[item.id, 'Quantity exceeds available stock.']];
+      return [];
+    }));
+    if (Object.keys(errors).length) {
+      setDispenseErrors(errors);
       return;
     }
-    const exceedsStock = selectedPrescription.items.some((item) => Number(quantities[item.id]) > availableFor(item));
-    if (exceedsStock) {
-      toast.error('A requested quantity exceeds current available stock. Refresh inventory and adjust the quantities.');
-      return;
-    }
+    setDispenseErrors({});
     dispenseMutation.mutate({ prescription: selectedPrescription, items });
   };
   const columns = [
@@ -111,7 +115,8 @@ export function PharmacyBasicQueuePage() {
               <p className="text-caption" style={{ margin: '.35rem 0' }}>{[item.dosage, item.frequency, item.durationDays ? `${item.durationDays} days` : null, item.instructions].filter(Boolean).join(' · ') || 'No additional directions'}</p>
               <p className="text-caption" style={{ margin: '.35rem 0' }}>Available stock: {available}{Array.isArray(medicine?.batches) && medicine.batches.length ? ` across ${medicine.batches.length} batches` : ''}</p>
               <label className="form-group__label" htmlFor={`dispense-${item.id}`}>Quantity to dispense</label>
-              <input id={`dispense-${item.id}`} className="form-control" type="number" min="1" max={available} step="1" required value={quantities[item.id] ?? ''} onChange={(event) => setQuantities((current) => ({ ...current, [item.id]: event.target.value }))} disabled={available < 1} />
+              <input id={`dispense-${item.id}`} className="form-control" type="number" min="1" max={available} step="1" required aria-invalid={Boolean(dispenseErrors[item.id])} value={quantities[item.id] ?? ''} onChange={(event) => { setQuantities((current) => ({ ...current, [item.id]: event.target.value })); setDispenseErrors((current) => ({ ...current, [item.id]: undefined })); }} disabled={available < 1} />
+              {dispenseErrors[item.id] && <span className="pharmacy-form-error" role="alert">{dispenseErrors[item.id]}</span>}
               {available < 1 && <p role="alert">No available stock. Replenish inventory before dispensing this medicine.</p>}
             </div>;
           })}
@@ -202,9 +207,10 @@ function supplierPriceInRupees(entry) {
 
 function validateMedicineForm(form, editingMed) {
   const errors = {};
-  if (!form.name.trim() || !form.genericName.trim() || !form.unitPrice) {
-    errors.form = 'Please enter all required fields.';
-  }
+  if (!form.name.trim()) errors.name = 'Enter a medicine name.';
+  if (!form.genericName.trim()) errors.genericName = 'Enter the generic name.';
+  if (!form.strength.trim()) errors.strength = 'Enter the medicine strength.';
+  if (!form.unitPrice) errors.unitPrice = 'Enter a selling price.';
   const capacity = Number(form.counterCapacity);
   const threshold = Number(form.reorderThreshold);
   if (!Number.isInteger(capacity) || capacity < 1) {
@@ -268,55 +274,66 @@ function MedicineFormFields({ medForm, setMedForm, medicineFormErrors, setMedici
         <input
           type="text"
           className="form-input"
+          aria-invalid={Boolean(medicineFormErrors.name)}
           value={medForm.name}
-          onChange={(event) => setMedForm({ ...medForm, name: event.target.value })}
+          onChange={(event) => { setMedForm({ ...medForm, name: event.target.value }); setMedicineFormErrors((current) => ({ ...current, name: undefined })); }}
           placeholder="e.g. Paracetamol 500mg"
         />
+        {medicineFormErrors.name && <span className="pharmacy-form-error" role="alert">{medicineFormErrors.name}</span>}
       </FormField>
       <FormField label="Generic Name *">
         <input
           type="text"
           className="form-input"
+          aria-invalid={Boolean(medicineFormErrors.genericName)}
           value={medForm.genericName}
-          onChange={(event) => setMedForm({ ...medForm, genericName: event.target.value })}
+          onChange={(event) => { setMedForm({ ...medForm, genericName: event.target.value }); setMedicineFormErrors((current) => ({ ...current, genericName: undefined })); }}
           placeholder="e.g. Paracetamol"
         />
+        {medicineFormErrors.genericName && <span className="pharmacy-form-error" role="alert">{medicineFormErrors.genericName}</span>}
       </FormField>
       <FormField label="Category *">
         <select
           className="form-input"
+          aria-invalid={Boolean(medicineFormErrors.category)}
           value={medForm.category}
-          onChange={(event) => setMedForm({ ...medForm, category: event.target.value })}
+          onChange={(event) => { setMedForm({ ...medForm, category: event.target.value }); setMedicineFormErrors((current) => ({ ...current, category: undefined })); }}
         >
           {CATEGORIES.filter((category) => category !== 'All').map((category) => (
             <option key={category} value={category}>{category}</option>
           ))}
         </select>
+        {medicineFormErrors.category && <span className="pharmacy-form-error" role="alert">{medicineFormErrors.category}</span>}
       </FormField>
       <FormField label="Dosage Form *">
         <select
           className="form-input"
+          aria-invalid={Boolean(medicineFormErrors.form)}
           value={medForm.form}
-          onChange={(event) => setMedForm({ ...medForm, form: event.target.value })}
+          onChange={(event) => { setMedForm({ ...medForm, form: event.target.value }); setMedicineFormErrors((current) => ({ ...current, form: undefined })); }}
         >
           {DOSAGE_FORMS.map((form) => <option key={form} value={form}>{form}</option>)}
         </select>
+        {medicineFormErrors.form && <span className="pharmacy-form-error" role="alert">{medicineFormErrors.form}</span>}
       </FormField>
       <FormField label="Strength *">
         <input
           type="text"
           className="form-input"
+          aria-invalid={Boolean(medicineFormErrors.strength)}
           value={medForm.strength}
-          onChange={(event) => setMedForm({ ...medForm, strength: event.target.value })}
+          onChange={(event) => { setMedForm({ ...medForm, strength: event.target.value }); setMedicineFormErrors((current) => ({ ...current, strength: undefined })); }}
           placeholder="e.g. 500mg or 100mcg"
         />
+        {medicineFormErrors.strength && <span className="pharmacy-form-error" role="alert">{medicineFormErrors.strength}</span>}
       </FormField>
       <FormField label="Manufacturer">
         <input
           type="text"
           className="form-input"
+          aria-invalid={Boolean(medicineFormErrors.manufacturer)}
           value={medForm.manufacturer}
-          onChange={(event) => setMedForm({ ...medForm, manufacturer: event.target.value })}
+          onChange={(event) => { setMedForm({ ...medForm, manufacturer: event.target.value }); setMedicineFormErrors((current) => ({ ...current, manufacturer: undefined })); }}
           placeholder="e.g. Cipla, Sun Pharma"
         />
       </FormField>
@@ -326,8 +343,9 @@ function MedicineFormFields({ medForm, setMedForm, medicineFormErrors, setMedici
           step="0.01"
           min="0.01"
           className="form-input"
+          aria-invalid={Boolean(medicineFormErrors.unitPrice)}
           value={medForm.unitPrice}
-          onChange={(event) => setMedForm({ ...medForm, unitPrice: event.target.value })}
+          onChange={(event) => { setMedForm({ ...medForm, unitPrice: event.target.value }); setMedicineFormErrors((current) => ({ ...current, unitPrice: undefined })); }}
           placeholder="e.g. 2.50"
         />
         {medicineFormErrors.unitPrice && <span className="pharmacy-form-error" role="alert">{medicineFormErrors.unitPrice}</span>}
@@ -338,6 +356,7 @@ function MedicineFormFields({ medForm, setMedForm, medicineFormErrors, setMedici
           min="1"
           step="1"
           className="form-input"
+          aria-invalid={Boolean(medicineFormErrors.counterCapacity)}
           value={medForm.counterCapacity}
           onChange={(event) => {
             const capacity = event.target.value;
@@ -366,6 +385,7 @@ function MedicineFormFields({ medForm, setMedForm, medicineFormErrors, setMedici
           max={medForm.counterCapacity}
           step="1"
           className="form-input"
+          aria-invalid={Boolean(medicineFormErrors.reorderThreshold)}
           value={medForm.reorderThreshold}
           onChange={(event) => {
             setMedForm({ ...medForm, reorderThreshold: event.target.value });
@@ -1182,7 +1202,7 @@ export function PharmacyInventoryPage() {
 
   const handleConfirmRestock = async () => {
     if (!restockingMed) return;
-    const qty = parseInt(restockForm.quantity, 10);
+    const qty = Number(restockForm.quantity);
     const errors = {};
     if (expiredRestockBatches.length) {
       errors.expired = 'Remove expired or undated batches before transferring stock.';
@@ -1381,6 +1401,16 @@ export function PharmacyInventoryPage() {
                           </button>
                           <button type="button" className="btn btn--secondary btn--sm" onClick={() => handleOpenEdit(m)}>
                             Edit
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn--secondary btn--sm pharmacy-inventory-status-action"
+                            onClick={() => {
+                              if (m.isActive) setPendingStatusMed(m);
+                              else handleToggleActive(m);
+                            }}
+                          >
+                            {m.isActive ? 'Deactivate' : 'Activate'}
                           </button>
                           <details className="pharmacy-row-menu">
                             <summary className="btn btn--secondary btn--sm" aria-label={`More actions for ${m.name}`} title="More actions">
@@ -1695,7 +1725,7 @@ export function PharmacyPurchasesPage() {
       setPoFormErrors({ medicine: 'Select a medicine from this supplier catalogue.' });
       return;
     }
-    const qty = parseInt(itemQty, 10);
+    const qty = Number(itemQty);
     if (!Number.isInteger(qty) || qty <= 0) {
       setPoFormErrors({ quantity: 'Enter a positive whole-number quantity.' });
       return;
@@ -1729,11 +1759,11 @@ export function PharmacyPurchasesPage() {
   const handleSavePo = async () => {
     const supplierId = poSupplierId || suppliers[0]?.id || '';
     if (!supplierId) {
-      toast.error('Please select a supplier.');
+      setPoFormErrors({ supplier: 'Select a supplier.' });
       return;
     }
     if (poItems.length === 0) {
-      toast.error('Please add at least one medication item.');
+      setPoFormErrors({ items: 'Add at least one medication item to the order.' });
       return;
     }
 
@@ -2039,6 +2069,7 @@ export function PharmacyPurchasesPage() {
             <FormField label="Supplier *">
               <select
                 className="form-input"
+                aria-invalid={Boolean(poFormErrors.supplier)}
                 value={poSupplierId || suppliers[0]?.id || ''}
                 onChange={(e) => {
                   const nextSupplierId = e.target.value;
@@ -2056,6 +2087,7 @@ export function PharmacyPurchasesPage() {
                   </option>
                 ))}
               </select>
+              {poFormErrors.supplier && <span className="pharmacy-form-error" role="alert">{poFormErrors.supplier}</span>}
             </FormField>
             <FormField label="Order Notes">
               <input
@@ -2361,6 +2393,7 @@ export function PharmacySuppliersPage() {
   const [selectedSup, setSelectedSup] = useState(null);
   const [supplierCatalogue, setSupplierCatalogue] = useState([]);
   const [supplierCatalogueError, setSupplierCatalogueError] = useState('');
+  const [supplierFormErrors, setSupplierFormErrors] = useState({});
   const [catalogueSearch, setCatalogueSearch] = useState('');
   const [debouncedCatalogueSearch, setDebouncedCatalogueSearch] = useState('');
   const [catalogueDropdownOpen, setCatalogueDropdownOpen] = useState(false);
@@ -2429,6 +2462,7 @@ export function PharmacySuppliersPage() {
     setSupForm({ name: '', contactPerson: '', phone: '', email: '', address: '' });
     setSupplierCatalogue([]);
     setSupplierCatalogueError('');
+    setSupplierFormErrors({});
     setCatalogueSearch('');
     setCataloguePriceErrors({});
     setSupplierModalOpen(true);
@@ -2449,6 +2483,7 @@ export function PharmacySuppliersPage() {
     })).filter((entry) => entry.medicineId);
     setSupplierCatalogue(catalogue);
     setSupplierCatalogueError('');
+    setSupplierFormErrors({});
     setCatalogueSearch('');
     setCataloguePriceErrors(Object.fromEntries(catalogue
       .filter((entry) => !entry.unitCost)
@@ -2525,8 +2560,18 @@ export function PharmacySuppliersPage() {
   };
 
   const handleSaveSupplier = async () => {
+    const errors = {};
     if (!supForm.name.trim()) {
-      toast.error('Supplier name is required.');
+      errors.name = 'Enter a supplier business name.';
+    }
+    if (supForm.email.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(supForm.email.trim())) {
+      errors.email = 'Enter a valid email address.';
+    }
+    if (supForm.phone.trim() && !/^[+\d()\s-]{7,20}$/.test(supForm.phone.trim())) {
+      errors.phone = 'Enter a valid phone number.';
+    }
+    setSupplierFormErrors(errors);
+    if (Object.keys(errors).length) {
       return;
     }
     const priceErrors = Object.fromEntries(supplierCatalogue.map((entry) => [
@@ -2723,10 +2768,12 @@ export function PharmacySuppliersPage() {
             <input
               type="text"
               className="form-input"
+              aria-invalid={Boolean(supplierFormErrors.name)}
               value={supForm.name}
-              onChange={(e) => setSupForm({ ...supForm, name: e.target.value })}
+              onChange={(e) => { setSupForm({ ...supForm, name: e.target.value }); setSupplierFormErrors((current) => ({ ...current, name: undefined })); }}
               placeholder="e.g. Apex Pharma Distributors"
             />
+            {supplierFormErrors.name && <span className="pharmacy-form-error" role="alert">{supplierFormErrors.name}</span>}
           </FormField>
           <FormField label="Contact Person">
             <input
@@ -2742,19 +2789,23 @@ export function PharmacySuppliersPage() {
               <input
                 type="text"
                 className="form-input"
+                aria-invalid={Boolean(supplierFormErrors.phone)}
                 value={supForm.phone}
-                onChange={(e) => setSupForm({ ...supForm, phone: e.target.value })}
+                onChange={(e) => { setSupForm({ ...supForm, phone: e.target.value }); setSupplierFormErrors((current) => ({ ...current, phone: undefined })); }}
                 placeholder="+91 98765 43210"
               />
+              {supplierFormErrors.phone && <span className="pharmacy-form-error" role="alert">{supplierFormErrors.phone}</span>}
             </FormField>
             <FormField label="Email Address">
               <input
                 type="email"
                 className="form-input"
+                aria-invalid={Boolean(supplierFormErrors.email)}
                 value={supForm.email}
-                onChange={(e) => setSupForm({ ...supForm, email: e.target.value })}
+                onChange={(e) => { setSupForm({ ...supForm, email: e.target.value }); setSupplierFormErrors((current) => ({ ...current, email: undefined })); }}
                 placeholder="orders@supplier.in"
               />
+              {supplierFormErrors.email && <span className="pharmacy-form-error" role="alert">{supplierFormErrors.email}</span>}
             </FormField>
           </div>
           <FormField label="Office / Warehouse Address">

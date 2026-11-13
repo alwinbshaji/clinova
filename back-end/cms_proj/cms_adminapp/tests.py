@@ -1,9 +1,14 @@
 """Focused regression coverage for admin staff creation and management."""
 
+from datetime import date
+
 from rest_framework.test import APITestCase
 
 from cms_backendapp.models import Department, LabTestCatalog, Role, Staff, User
+from cms_doctorapp.models import Doctor, LabTest
+from cms_labapp.models import LabTestResult
 from cms_pharmapp.models import Supplier
+from cms_recepapp.models import Patient
 
 
 class AdminStaffFlowTests(APITestCase):
@@ -255,7 +260,10 @@ class AdminStaffFlowTests(APITestCase):
             "code": "CBC",
             "category": "Hematology",
             "sampleType": "Blood",
-            "parameters": [{"name": "Hemoglobin"}],
+            "parameters": [
+                {"name": "Hemoglobin", "unit": "g/dL", "refMin": 12.0, "refMax": 17.5},
+                {"name": "Hematocrit", "unit": "%", "refMin": 36, "refMax": 53},
+            ],
             "turnaroundHrs": 8,
             "description": "Complete blood count profile",
             "price": 125000,
@@ -265,11 +273,24 @@ class AdminStaffFlowTests(APITestCase):
         self.assertEqual(created.status_code, 201, created.data)
         self.assertEqual(created.data["name"], payload["name"])
         self.assertEqual(created.data["price"], payload["price"])
+        self.assertEqual(created.data["parameters"], payload["parameters"])
         self.assertEqual(LabTestCatalog.objects.count(), 1)
+
+        price_update = self.client.patch(
+            f"/api/admin/lab-catalog/{created.data['id']}/",
+            {"price": 135000},
+            format="json",
+        )
+        self.assertEqual(price_update.status_code, 200, price_update.data)
+        self.assertEqual(price_update.data["price"], 135000)
 
         listed = self.client.get("/api/admin/lab-catalog/")
         self.assertEqual(listed.status_code, 200)
         self.assertEqual(listed.data["count"], 1)
+        lab_catalog = self.client.get("/api/lab-catalog/")
+        self.assertEqual(lab_catalog.status_code, 200)
+        visible_test = next(row for row in lab_catalog.data["results"] if row["id"] == created.data["id"])
+        self.assertEqual(visible_test["parameters"], payload["parameters"])
 
         duplicate = self.client.post("/api/admin/lab-catalog/", payload, format="json")
         self.assertEqual(duplicate.status_code, 400)
@@ -279,6 +300,80 @@ class AdminStaffFlowTests(APITestCase):
         self.assertEqual(invalid.status_code, 400)
         self.assertIn("name", invalid.data)
         self.assertIn("turnaroundHrs", invalid.data)
+
+        invalid_code = self.client.post(
+            "/api/admin/lab-catalog/",
+            {**payload, "name": "Invalid Code Test", "code": "bad code"},
+            format="json",
+        )
+        self.assertEqual(invalid_code.status_code, 400)
+        self.assertIn("code", invalid_code.data)
+
+        invalid_parameters = self.client.post(
+            "/api/admin/lab-catalog/",
+            {
+                **payload,
+                "name": "Invalid Parameters Test",
+                "code": "BADPARAM",
+                "parameters": [{"name": "Sodium", "refMin": -1, "refMax": 5, "criticalMin": 0}],
+            },
+            format="json",
+        )
+        self.assertEqual(invalid_parameters.status_code, 400)
+        self.assertIn("parameters", invalid_parameters.data)
+
+    def test_catalog_edit_preserves_parameters_used_by_saved_results(self):
+        catalog = LabTestCatalog.objects.create(
+            test_catalog_id="safe-edit",
+            test_name="Safe Edit Test",
+            code="SAFEEDIT",
+            category="Hematology",
+            parameters=[
+                {"name": "Hemoglobin", "unit": "g/dL", "refMin": 12, "refMax": 17},
+                {"name": "Hematocrit", "unit": "%", "refMin": 36, "refMax": 53},
+            ],
+        )
+        doctor_role = Role.objects.create(role_id="DOCTOR", role_name="Doctor")
+        doctor_staff = Staff.objects.create(name="Catalog Test Doctor", role=doctor_role)
+        doctor = Doctor.objects.create(doctor_id="cat-doctor", staff=doctor_staff)
+        patient = Patient.objects.create(patient_id="cat-patient", name="Catalog Test Patient")
+        lab_test = LabTest.objects.create(
+            test_id="cat-lab-test",
+            patient=patient,
+            doctor=doctor,
+            test_catalog=catalog,
+            ordered_date=date.today(),
+        )
+        LabTestResult.objects.create(
+            result_id="catalog-result",
+            test=lab_test,
+            performed_by=self.admin_staff,
+            result_date=date.today(),
+            results=[{"parameter": "Hemoglobin", "value": "14"}],
+        )
+
+        response = self.client.patch(
+            f"/api/admin/lab-catalog/{catalog.pk}/",
+            {"parameters": [{"name": "Hematocrit", "unit": "%", "refMin": 37, "refMax": 52}]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Cannot remove or rename 'Hemoglobin'", str(response.data["parameters"]))
+
+        allowed_edit = self.client.patch(
+            f"/api/admin/lab-catalog/{catalog.pk}/",
+            {"parameters": [
+                {"name": "Hemoglobin", "unit": "g/dL", "refMin": 13, "refMax": 17},
+                {"name": "Hematocrit", "unit": "%", "refMin": 37, "refMax": 52},
+                {"name": "RBC Count", "unit": "million/µL"},
+            ]},
+            format="json",
+        )
+        self.assertEqual(allowed_edit.status_code, 200, allowed_edit.data)
+        self.assertEqual(len(allowed_edit.data["parameters"]), 3)
+        self.assertEqual(allowed_edit.data["parameters"][0]["refMin"], 13)
+        saved_result = LabTestResult.objects.get(pk="catalog-result")
+        self.assertEqual(saved_result.results, [{"parameter": "Hemoglobin", "value": "14"}])
 
     def test_supplier_can_be_created_and_listed_with_validation(self):
         payload = {

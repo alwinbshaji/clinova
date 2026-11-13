@@ -29,7 +29,9 @@ class LabCatalogViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
         if self.action in ["list", "retrieve"]:
             return [IsRole("ADMIN", "DOCTOR", "LAB_TECH", "RECEPTIONIST")()]
-        if self.action in ["create", "partial_update"]:
+        if self.action == "create":
+            return [IsRole("ADMIN")()]
+        if self.action == "partial_update":
             return [IsRole("ADMIN", "LAB_TECH")()]
         return [IsRole("ADMIN")()]
 
